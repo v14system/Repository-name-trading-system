@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>V14 PRO ELITE MAX</title>
+
+<style>
+
+body{
+background:#0b0b0b;
+color:#eee;
+font-family:Arial;
+padding:20px
+}
+
+input,button{
+padding:8px;
+margin:5px
+}
+
+.card{
+background:#181818;
+padding:20px;
+margin-top:15px;
+border-radius:10px
+}
+
+.green{color:#00ff88}
+.red{color:#ff4444}
+.yellow{color:#ffd700}
+.alert{color:#ff00ff;font-weight:bold}
+.small{font-size:12px;color:#888}
+
+table{
+width:100%;
+border-collapse:collapse
+}
+
+td,th{
+padding:6px;
+border-bottom:1px solid #333;
+font-size:13px
+}
+
+</style>
+
+</head>
+<body>
+
+<h2>V14 PRO ELITE MAX 交易辅助系统</h2>
+
+<input id="symbolInput" placeholder="BTCUSDT">
+<button onclick="start()">启动</button>
+
+<div id="panel" class="card"></div>
+
+<div class="card">
+<h3>胜率统计</h3>
+<div id="stats"></div>
+</div>
+
+<div class="card">
+<h3>信号历史</h3>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>币种</th>
+<th>信号</th>
+<th>Entry</th>
+<th>Stop</th>
+<th>Target</th>
+</tr>
+</thead>
+<tbody id="history"></tbody>
+</table>
+</div>
+
+<script>
+
+let symbol=""
+let price=0
+
+let prices=[]
+let cvd=0
+let cvdHist=[]
+
+let bidVol=0
+let askVol=0
+
+let oiHistory=[]
+let fundingHistory=[]
+
+let pivots=[]
+let lastHigh=null
+let lastLow=null
+
+let structure="NEUTRAL"
+let stage="震荡"
+let choch="NONE"
+
+let lockedSignal="NONE"
+let lockTime=0
+
+let entryPrice=0
+let stopPrice=0
+let targetPrice=0
+let rrRatio=0
+
+const LOCK_TIME=30000
+
+let signalHistory=JSON.parse(localStorage.getItem("signals")) || []
+
+// EMA
+function EMA(arr,p){
+
+if(arr.length<p)return 0
+
+let k=2/(p+1)
+
+let ema=arr[arr.length-p]
+
+for(let i=arr.length-p+1;i<arr.length;i++){
+
+ema=arr[i]*k+ema*(1-k)
+
+}
+
+return ema
+
+}
+
+// ATR
+function ATR(period=14){
+
+if(prices.length<period+1)return 0
+
+let sum=0
+
+for(let i=prices.length-period;i<prices.length;i++){
+
+sum+=Math.abs(prices[i]-prices[i-1])
+
+}
+
+return sum/period
+
+}
+
+// Pivot
+function detectPivot(){
+
+if(prices.length<20)return
+
+let i=prices.length-6
+
+let left=prices.slice(i-5,i)
+let right=prices.slice(i+1,i+6)
+
+let center=prices[i]
+
+if(center>Math.max(...left) && center>Math.max(...right)){
+pivots.push({type:"HIGH",price:center})
+}
+
+if(center<Math.min(...left) && center<Math.min(...right)){
+pivots.push({type:"LOW",price:center})
+}
+
+if(pivots.length>30)pivots.shift()
+
+}
+
+// 结构
+function updateStructure(){
+
+if(pivots.length<1)return
+
+let lastPivot=pivots[pivots.length-1]
+
+if(lastPivot.type==="HIGH"){
+
+if(!lastHigh || lastPivot.price>lastHigh){
+structure="BULL"
+stage="上涨趋势"
+}else{
+structure="BEAR"
+}
+
+lastHigh=lastPivot.price
+}
+
+if(lastPivot.type==="LOW"){
+
+if(!lastLow || lastPivot.price<lastLow){
+structure="BEAR"
+stage="下跌趋势"
+}else{
+structure="BULL"
+}
+
+lastLow=lastPivot.price
+}
+
+// CHoCH
+
+if(lastLow && price<lastLow && structure==="BULL"){
+choch="CHoCH_BEAR"
+structure="BEAR"
+lockedSignal="NONE"
+}
+
+if(lastHigh && price>lastHigh && structure==="BEAR"){
+choch="CHoCH_BULL"
+structure="BULL"
+lockedSignal="NONE"
+}
+
+}
+
+// 行为
+
+function imbalance(){
+
+if(bidVol+askVol===0)return 0
+
+return (bidVol-askVol)/(bidVol+askVol)
+
+}
+
+function analyzeOI(){
+
+if(oiHistory.length<2)return 0
+
+let last=oiHistory.at(-1)
+let prev=oiHistory.at(-2)
+
+return (last-prev)/prev*100
+
+}
+
+function fundingSlope(){
+
+if(fundingHistory.length<3)return 0
+
+let a=fundingHistory.at(-3)
+let b=fundingHistory.at(-2)
+let c=fundingHistory.at(-1)
+
+if(a<b && b<c)return 1
+if(a>b && b>c)return -1
+
+return 0
+
+}
+
+// OI趋势
+
+function oiTrend(){
+
+if(oiHistory.length<5)return "无"
+
+let first=oiHistory[oiHistory.length-5]
+let last=oiHistory[oiHistory.length-1]
+
+if(last>first)return "增仓"
+if(last<first)return "减仓"
+
+return "中性"
+
+}
+
+// 订单簿
+
+function orderBookPressure(){
+
+let total=bidVol+askVol
+
+if(total===0)return "无"
+
+let ratio=bidVol/total
+
+if(ratio>0.6)return "买盘强"
+if(ratio<0.4)return "卖盘强"
+
+return "均衡"
+
+}
+
+// 多周期
+
+function multiTF(){
+
+let tf5=EMA(prices,20)>EMA(prices,60)?"BULL":"BEAR"
+let tf15=EMA(prices,60)>EMA(prices,120)?"BULL":"BEAR"
+let tf1h=EMA(prices,120)>EMA(prices,200)?"BULL":"BEAR"
+
+let score=0
+
+if(tf5==="BULL")score++
+if(tf15==="BULL")score++
+if(tf1h==="BULL")score++
+
+return {tf5,tf15,tf1h,res:score+"/3"}
+
+}
+
+// 信号记录
+
+function recordSignal(signal,entry,stop,target){
+
+if(signal==="NONE")return
+
+let data={
+
+time:new Date().toLocaleString(),
+
+symbol:symbol,
+
+signal:signal,
+
+entry:entry,
+
+stop:stop,
+
+target:target
+
+}
+
+signalHistory.push(data)
+
+if(signalHistory.length>200)signalHistory.shift()
+
+localStorage.setItem("signals",JSON.stringify(signalHistory))
+
+}
+
+// 胜率
+
+function calculateStats(){
+
+let win=0
+let lose=0
+
+signalHistory.forEach(s=>{
+
+if(s.signal==="LONG" && price>=s.target)win++
+if(s.signal==="SHORT" && price<=s.target)win++
+
+if(s.signal==="LONG" && price<=s.stop)lose++
+if(s.signal==="SHORT" && price>=s.stop)lose++
+
+})
+
+let total=win+lose
+
+let rate=total>0?(win/total*100).toFixed(1):0
+
+return{win,lose,rate}
+
+}
+
+// 历史
+
+function renderHistory(){
+
+let html=""
+
+signalHistory.slice(-20).reverse().forEach(s=>{
+
+html+=`
+<tr>
+<td>${s.time}</td>
+<td>${s.symbol}</td>
+<td class="${s.signal==="LONG"?"green":"red"}">${s.signal}</td>
+<td>${s.entry.toFixed(2)}</td>
+<td>${s.stop.toFixed(2)}</td>
+<td>${s.target.toFixed(2)}</td>
+</tr>
+`
+
+})
+
+document.getElementById("history").innerHTML=html
+
+}
+
+// 主计算
+
+function calculate(){
+
+if(prices.length<150)return
+
+detectPivot()
+updateStructure()
+
+let ema20=EMA(prices,20)
+let ema60=EMA(prices,60)
+let ema120=EMA(prices,120)
+
+let atr=ATR()
+
+let behaviorBull=0
+let behaviorBear=0
+
+if(cvdHist.at(-1)>cvdHist.at(-5))behaviorBull+=15
+if(cvdHist.at(-1)<cvdHist.at(-5))behaviorBear+=15
+
+let imb=imbalance()
+
+if(imb>0.2)behaviorBull+=15
+if(imb<-0.2)behaviorBear+=15
+
+let oiChange=analyzeOI()
+
+if(oiChange>3)behaviorBear+=10
+if(oiChange<-3)behaviorBull+=10
+
+let slope=fundingSlope()
+
+if(slope===1)behaviorBear+=5
+if(slope===-1)behaviorBull+=5
+
+let trendHealthy=false
+
+if(ema20>ema60 && ema60>ema120 && price>ema20)trendHealthy=true
+if(ema20<ema60 && ema60<ema120 && price<ema20)trendHealthy=true
+
+let volatility=Math.abs(prices.at(-1)-prices.at(-20))/price
+
+let chop=false
+
+if(volatility<0.0015)chop=true
+
+let score=0
+
+if(structure!=="NEUTRAL")score+=40
+if(trendHealthy)score+=20
+
+score+=Math.max(behaviorBull,behaviorBear)*0.8
+
+if(!chop)score+=10
+
+if(Date.now()-lockTime>LOCK_TIME && score>=70 && trendHealthy && !chop){
+
+if(structure==="BULL" && behaviorBull>25 && lastLow){
+
+entryPrice=price
+stopPrice=lastLow-atr*0.5
+targetPrice=price+(price-stopPrice)*2
+
+rrRatio=((targetPrice-price)/(price-stopPrice)).toFixed(2)
+
+lockedSignal="LONG"
+
+lockTime=Date.now()
+
+recordSignal("LONG",entryPrice,stopPrice,targetPrice)
+
+}
+
+if(structure==="BEAR" && behaviorBear>25 && lastHigh){
+
+entryPrice=price
+stopPrice=lastHigh+atr*0.5
+targetPrice=price-(stopPrice-price)*2
+
+rrRatio=((price-targetPrice)/(stopPrice-price)).toFixed(2)
+
+lockedSignal="SHORT"
+
+lockTime=Date.now()
+
+recordSignal("SHORT",entryPrice,stopPrice,targetPrice)
+
+}
+
+}
+
+let risk="低"
+
+if(score<70)risk="中"
+if(chop)risk="震荡风险"
+
+let mtf=multiTF()
+
+document.getElementById("panel").innerHTML=`
+
+<h3>${symbol}</h3>
+
+<p>价格: ${price}</p >
+
+<p>结构: ${structure}</p >
+
+<p>阶段: ${stage}</p >
+
+<p>综合评分: ${score.toFixed(0)}</p >
+
+<p>决策信号:
+<b class="${lockedSignal==="LONG"?"green":lockedSignal==="SHORT"?"red":"yellow"}">
+${lockedSignal}
+</b>
+</p >
+
+<p>入场价: ${entryPrice?entryPrice.toFixed(2):"-"}</p >
+
+<p>止损价: ${stopPrice?stopPrice.toFixed(2):"-"}</p >
+
+<p>止盈价: ${targetPrice?targetPrice.toFixed(2):"-"}</p >
+
+<p>RR: ${rrRatio?rrRatio:"-"}</p >
+
+<p>风险等级: ${risk}</p >
+
+<p>OI趋势: ${oiTrend()}</p >
+
+<p>订单簿: ${orderBookPressure()}</p >
+
+<p>5m: ${mtf.tf5}</p >
+<p>15m: ${mtf.tf15}</p >
+<p>1h: ${mtf.tf1h}</p >
+<p>共振: ${mtf.res}</p >
+
+${choch!=="NONE"?`<p class="alert">结构破坏: ${choch}</p >`:""}
+
+<p class="small">V14 PRO ELITE MAX</p >
+
+`
+
+let stat=calculateStats()
+
+document.getElementById("stats").innerHTML=
+
+`
+胜: ${stat.win} |
+负: ${stat.lose} |
+胜率: ${stat.rate}%
+`
+
+renderHistory()
+
+}
+
+// 启动
+
+function start(){
+
+symbol=document.getElementById("symbolInput").value.toUpperCase()
+
+let tradeWS=new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`)
+
+let depthWS=new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@depth5@100ms`)
+
+tradeWS.onmessage=(e)=>{
+
+let d=JSON.parse(e.data)
+
+price=parseFloat(d.p)
+
+let qty=parseFloat(d.q)
+
+if(d.m)cvd-=qty
+else cvd+=qty
+
+prices.push(price)
+cvdHist.push(cvd)
+
+if(prices.length>1000){
+
+prices.shift()
+cvdHist.shift()
+
+}
+
+}
+
+depthWS.onmessage=(e)=>{
+
+let d=JSON.parse(e.data)
+
+bidVol=d.bids.reduce((a,b)=>a+parseFloat(b[1]),0)
+askVol=d.asks.reduce((a,b)=>a+parseFloat(b[1]),0)
+
+}
+
+setInterval(fetchOI,5000)
+setInterval(fetchFunding,8000)
+setInterval(calculate,3000)
+
+}
+
+// OI
+
+async function fetchOI(){
+
+let r=await fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`)
+
+let d=await r.json()
+
+oiHistory.push(parseFloat(d.openInterest))
+
+if(oiHistory.length>50)oiHistory.shift()
+
+}
+
+// funding
+
+async function fetchFunding(){
+
+let r=await fetch(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=3`)
+
+let d=await r.json()
+
+fundingHistory=d.map(x=>parseFloat(x.fundingRate))
+
+}
+
+</script>
+
+</body>
+</html>
